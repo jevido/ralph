@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# ralph — works a project toward its goal, alternating /planning and /work, one fresh
+# Claude session per step, until the planner says the goal is fully covered.
+#
+#   cd ~/Projects/<project> && ralph    run the loop for that project
+#   ralph tail                          follow the running session
+#   ralph stop                          stop the loop and the session it is running
+#
+# The project is the git repository you run it in (a worktree counts as its main
+# checkout). Its goal is ~/Projects/planning/<project>/GOAL.md: what to build and what
+# is fixed. Every choice ralph makes instead of asking goes to NOTES.md beside it.
+# Env: RALPH_MAX (steps, default 60), RALPH_MODEL (optional),
+#      RALPH_PROJECTS (default ~/Projects), RALPH_PLANNING (default $RALPH_PROJECTS/planning).
+
+set -euo pipefail
+
+PROJECTS_ROOT=${RALPH_PROJECTS:-$HOME/Projects}
+PLANNING=${RALPH_PLANNING:-$PROJECTS_ROOT/planning}
+
+REPO=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "ralph: not in a git repository" >&2; exit 1; }
+MAIN=$(dirname "$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir)")
+PROJECT=$(basename "$MAIN")
+if [[ $MAIN != "$PROJECTS_ROOT"/* || $PROJECT == planning ]]; then
+	echo "ralph: $REPO is not a project under $PROJECTS_ROOT" >&2
+	exit 1
+fi
+PROJECT_DIR=$PLANNING/$PROJECT
+PHASES=$PROJECT_DIR/phases
+GOAL=$PROJECT_DIR/GOAL.md
+NOTES=$PROJECT_DIR/NOTES.md
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/ralph/$PROJECT
+mkdir -p "$STATE"
+
+case ${1:-} in
+tail)
+	echo "following $STATE/current.log" >&2
+	tail -n +1 -F "$STATE/current.log" 2>/dev/null | jq -Rr --unbuffered '
+	  (try fromjson catch {type:"raw", line: .}) as $e
+	  | if $e.type == "raw" then $e.line
+	    elif $e.type == "system" and $e.subtype == "init" then "\n\u001b[1m━━ session \($e.session_id) · \($e.model)\u001b[0m"
+	    elif $e.type == "assistant" then
+	      $e.message.content[]
+	      | if .type == "thinking" then "\u001b[2;3m💭 \(.thinking // "")\u001b[0m"
+	        elif .type == "text" then "\u001b[0m\(.text)"
+	        elif .type == "tool_use" then
+	          "\u001b[36m▶ \(.name) \u001b[2m\(.input | (.command // .file_path // .pattern // .skill // .description // tostring) | tostring | .[0:200])\u001b[0m"
+	        else empty end
+	    elif $e.type == "user" then
+	      ($e.message.content | if type == "array" then .[] else empty end
+	       | select(.type == "tool_result" and .is_error == true)
+	       | "\u001b[31m✗ \(.content | tostring | .[0:300])\u001b[0m")
+	    elif $e.type == "result" then "\u001b[1m━━ \($e.subtype) · \($e.num_turns) turns · $\($e.total_cost_usd // 0)\u001b[0m\n"
+	    else empty end'
+	exit 0
+	;;
+stop)
+	[[ -f $STATE/pid ]] || { echo "ralph: not running for $PROJECT"; exit 0; }
+	kill -TERM "$(cat "$STATE/pid")" 2>/dev/null && echo "ralph: stopping $PROJECT" || echo "ralph: not running for $PROJECT"
+	exit 0
+	;;
+"") ;;
+*)
+	echo "usage: ralph [tail|stop]" >&2
+	exit 1
+	;;
+esac
+
+[[ -f $GOAL ]] || { echo "ralph: no goal for $PROJECT: write $GOAL" >&2; exit 1; }
+
+exec 9>"$STATE/lock"
+flock -n 9 || { echo "ralph: already running for $PROJECT (ralph stop, or ralph tail)" >&2; exit 1; }
+echo $$ >"$STATE/pid"
+
+# Job control gives each step its own process group, so stopping kills claude and
+# every tool it started, not just the subshell around it.
+set -m
+child=
+cleanup() {
+	if [[ -n $child ]]; then
+		kill -TERM -- "-$child" 2>/dev/null || true
+		sleep 2
+		kill -KILL -- "-$child" 2>/dev/null || true
+	fi
+	rm -f "$STATE/pid"
+}
+trap 'cleanup; echo "ralph: stopped"; exit 130' INT TERM
+trap 'rm -f "$STATE/pid"' EXIT
+
+CLAUDE_ARGS=(-p --output-format stream-json --verbose --permission-mode auto
+	# No MCP servers: the loop has no business in deploy tools, trackers or docs sites.
+	--strict-mcp-config --mcp-config '{"mcpServers":{}}')
+[[ -n ${RALPH_MODEL:-} ]] && CLAUDE_ARGS+=(--model "$RALPH_MODEL")
+
+RULES="You are ralph, an unattended loop: no one is at the keyboard, one step per session.
+
+THE GOAL is $GOAL. Read it first, every step. What it says is fixed is not up for
+choice; work nothing that does not serve it. Code is worked in $REPO on the current
+branch; the plans live in $PROJECT_DIR.
+
+Everything is local. Never push, deploy, open a PR, or touch production, a deploy
+platform, or anything outside $REPO and $PROJECT_DIR. Production work is not planned at
+all, not even as a blocked task. Never git add -A in the planning repo.
+
+You make every choice yourself. Never call AskUserQuestion. Wherever a task, the skills,
+the repo's CLAUDE.md or its docs would block on a decision or ask the user, list the
+options you see, pick the one you would recommend, and carry on. Append each to $NOTES:
+  ## <date> · <phase>/<task> · <the choice in one line>
+  Options I saw: … Picked: … Why: … If reversed: …
+Commit NOTES.md with the planning commit of the same step.
+
+Never skip a problem or leave it for later. If something is broken, missing or wrong
+where the work goes, fix it now as part of the task; if it is too big, add a task right
+after the current one and stop, so the next step does it. status: blocked is only for
+what no local session can ever do (a secret or an account it cannot have), with the
+exact steps for a person in its Notes."
+
+PLAN_PROMPT="/planning Plan the next phase toward the goal of project $PROJECT.
+$RULES
+
+Plan the next slice of the goal that no phase in phases/ covers yet, in the order the
+goal gives. Read the code first, as the skill says. Instead of sparring, settle every
+fork yourself and note it in NOTES.md. Never edit GOAL.md. If the goal is fully covered
+by phases, write nothing and end your reply with the line: RALPH: NOTHING TO PLAN
+Otherwise commit the phase as the skill says, and stop. Do not start /work."
+
+WORK_PROMPT="/work
+$RULES
+
+Implement exactly ONE task: the in_progress one if there is one, else the next todo.
+If it is blocked on a decision, decide it (options and pick in NOTES.md), rewrite it to
+what you chose, and do it. Verify it, mark it done, make both commits, update SUMMARY.md
+if it finished the phase, then stop. Do not start the next task."
+
+task_files() { ls "$PHASES"/*/[0-9]*.md 2>/dev/null || true; }
+status_of() { grep -m1 '^status:' "$1" | awk '{print $2}' || true; }
+heads() { git -C "$REPO" rev-parse HEAD; git -C "$PLANNING" rev-parse HEAD; }
+note() {
+	echo "ralph[$PROJECT]: $*"
+	command -v notify-send >/dev/null && notify-send "ralph: $PROJECT" "$*" || true
+}
+
+echo "ralph[$PROJECT]: $REPO ($(git -C "$REPO" branch --show-current)) toward $GOAL"
+echo "ralph[$PROJECT]: watch with 'ralph tail', stop with 'ralph stop' or Ctrl-C"
+MAX=${RALPH_MAX:-60}
+stuck=0
+blocked_seen=
+for ((i = 1; i <= MAX; i++)); do
+	# The first task not done, in phase order. A blocked one gets a work step that
+	# decides it; if that step leaves it blocked, it truly needs a person.
+	next=
+	while read -r f; do
+		[[ -z $f ]] && continue
+		[[ $(status_of "$f") != done ]] && { next=$f; break; }
+	done <<<"$(task_files)"
+
+	if [[ -z $next ]]; then
+		step=plan prompt=$PLAN_PROMPT
+	else
+		if [[ $(status_of "$next") == blocked ]]; then
+			[[ $blocked_seen == "$next" ]] && { note "needs you: $next (see its Notes)"; exit 2; }
+			blocked_seen=$next
+		fi
+		step=work prompt=$WORK_PROMPT
+	fi
+
+	log=$STATE/$(date +%Y%m%d-%H%M%S)-$i-$step.log
+	echo "ralph[$PROJECT]: step $i/$MAX: $step${next:+ (${next#"$PHASES"/})}"
+	ln -sfn "$log" "$STATE/current.log"
+	before=$(heads)
+	# Backgrounded and waited on so Ctrl-C and 'ralph stop' reach the trap at once.
+	# The prompt goes in on stdin: --mcp-config is variadic and would swallow it.
+	(cd "$REPO" && printf "%s" "$prompt" | exec claude "${CLAUDE_ARGS[@]}" 9>&-) >"$log" 2>&1 &
+	child=$!
+	wait "$child" || true
+	child=
+
+	if [[ $step == plan ]] && jq -r 'select(.type=="result") | .result // ""' "$log" 2>/dev/null | grep -q 'RALPH: NOTHING TO PLAN'; then
+		note "done: the goal is fully planned and worked; review $NOTES"
+		exit 0
+	fi
+
+	if [[ $(heads) == "$before" ]]; then
+		((++stuck >= 3)) && { note "stuck: 3 steps without a commit, last log $log"; exit 3; }
+	else
+		stuck=0
+	fi
+done
+note "reached RALPH_MAX=$MAX steps; review $NOTES"
