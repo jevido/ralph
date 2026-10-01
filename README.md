@@ -13,7 +13,8 @@ the loop runs.
 ## Run it
 
 ```sh
-cd ~/Projects/<project> && ralph   # run the loop for that project
+cd ~/Projects/<project> && ralph   # run the loop for the project's one open goal
+ralph <goal>                       # run it for that goal, when there are several
 ralph tail                         # follow the running session: thinking, text, tool calls
 ralph stop                         # stop the loop and everything it started (Ctrl-C works too)
 ```
@@ -26,28 +27,73 @@ the current branch.
 
 ```
 ~/Projects/planning/<project>/
-  GOAL.md                          you write it: what to build, what is fixed, in what order
-  NOTES.md                         ralph writes it: every choice he made instead of asking
-  phases/NN-<name>/goal.md         written by /planning
+  <goal>/GOAL.md                   you write it (or /planning goal): frontmatter, then what to build, what is fixed, in what order
+  <goal>/NOTES.md                  ralph writes it: every choice he made for that goal instead of asking
+  phases/NN-<name>/goal.md         written by /planning, with a `**Goal:** <goal>` line naming the goal it serves
   phases/NN-<name>/NN-<task>.md    one task each, with frontmatter `status: todo|in_progress|done|blocked`
+  SUMMARY.md                       written by /work: what the project is
 ```
 
-Ralph refuses to start without a `GOAL.md`. Put everything that belongs to the
-project in it (the stack, what is fixed, the order to work in); the script only
-holds the rules that apply to every project.
+A project has as many goals as you like, one directory each. Ralph works one at
+a time. A goal keeps its directory when it ends, so you can write the next one
+while ralph is still working the current one. Put everything that belongs to
+the goal in its `GOAL.md` (the stack, what is fixed, the order to work in); the
+script only holds the rules that apply to every project.
+
+Phases stay in the project's one `phases/`, numbered across goals. Ralph works
+the first task that isn't `done` in any phase, so an open task left behind by an
+earlier goal gets finished first.
+
+## Which goal
+
+`ralph` with no name runs the project's one open goal: one that hasn't
+`succeeded` or `failed`. If there are several open goals, it lists them and you
+name one. `ralph <goal>` also resumes a `failed` goal once you've fixed what
+failed it. It refuses one that `succeeded`.
+
+## GOAL.md frontmatter
+
+```markdown
+---
+status: todo             # ralph sets it, see below
+max: 400                 # steps before it stops
+model: claude-opus-5-5   # model for every step; this is the default
+---
+
+# Goal
+...
+```
+
+All keys are optional. When ralph starts a goal, he writes in the default for
+any of `max` and `model` it leaves out, so the goal shows what it runs with (an
+env override is for that run only and is never written). Unknown keys are
+ignored with a warning. Steps are told
+the frontmatter is ralph's, not part of the goal.
+
+Ralph sets `status` and commits only `GOAL.md` each time:
+
+| `status`    | when                                                                        |
+| ----------- | --------------------------------------------------------------------------- |
+| `todo`      | not started yet; the same as no status                                      |
+| `running`   | ralph is working it                                                         |
+| `stopped`   | `ralph stop` or Ctrl-C; run it again to carry on                            |
+| `succeeded` | the planner found nothing left to plan; adds `finished:`                    |
+| `failed`    | blocked, stuck or out of steps; adds `finished:` and `reason:` saying which |
 
 ## Each step
 
 1. Find the first task that isn't `done`, in phase order.
 2. If there is one, run `/work` on exactly that task. A task blocked on a
    decision gets decided, noted, rewritten and done.
-3. If there is none, run `/planning` for the next phase of the goal.
+3. If there is none, run `/planning` for the next phase of the goal. A phase
+   belongs to the goal its `**Goal:**` line names. A phase without one dates from
+   before goal directories, and the planner counts it if it serves the goal.
 4. Stop when:
-   - the planner answers `RALPH: NOTHING TO PLAN`: done;
+   - the planner answers `RALPH: NOTHING TO PLAN`: `succeeded`;
    - a blocked task is still blocked after a step that tried to decide it:
-     something only a person can do, like a secret; its Notes say what;
-   - 3 steps in a row made no commit: stuck, see the last log;
-   - `RALPH_MAX` steps have run.
+     something only a person can do, like a secret; its Notes say what. `failed`;
+   - 3 steps in a row made no commit: stuck, see the last log. `failed`;
+   - `max` steps have run. `failed`.
 
 ## The rules every step gets
 
@@ -69,12 +115,16 @@ ln -sf ~/Projects/ralph/ralph ~/.local/bin/ralph
 
 ## Environment
 
-| Variable         | Default                     |                                            |
-| ---------------- | --------------------------- | ------------------------------------------ |
-| `RALPH_MAX`      | `60`                        | steps before it stops                      |
-| `RALPH_MODEL`    | Claude Code's default       | model for every step                       |
-| `RALPH_PROJECTS` | `~/Projects`                | where project repositories live            |
-| `RALPH_PLANNING` | `$RALPH_PROJECTS/planning`  | where the planning directories live        |
+`RALPH_MAX` and `RALPH_MODEL` override `max` and `model` from the frontmatter
+for one run. The other two say where to find goals, so they can only be set
+here.
+
+| Variable         | Default                         |                                     |
+| ---------------- | ------------------------------- | ----------------------------------- |
+| `RALPH_MAX`      | `max`, else `400`               | steps before it stops               |
+| `RALPH_MODEL`    | `model`, else `claude-opus-5-5` | model for every step                |
+| `RALPH_PROJECTS` | `~/Projects`                    | where project repositories live     |
+| `RALPH_PLANNING` | `$RALPH_PROJECTS/planning`      | where the planning directories live |
 
 Logs are in `~/.local/state/ralph/<project>/`, one per step. `current.log`
 points at the running one.

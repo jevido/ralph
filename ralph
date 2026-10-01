@@ -1,16 +1,26 @@
 #!/usr/bin/env bash
-# ralph — works a project toward its goal, alternating /planning and /work, one fresh
-# Claude session per step, until the planner says the goal is fully covered.
+# ralph — works a project toward one of its goals, alternating /planning and /work, one
+# fresh Claude session per step, until the planner says the goal is fully covered.
 #
-#   cd ~/Projects/<project> && ralph    run the loop for that project
+#   cd ~/Projects/<project> && ralph    run the loop for the project's one open goal
+#   ralph <goal>                        run it for that goal, when there are several
 #   ralph tail                          follow the running session
 #   ralph stop                          stop the loop and the session it is running
 #
 # The project is the git repository you run it in (a worktree counts as its main
-# checkout). Its goal is ~/Projects/planning/<project>/GOAL.md: what to build and what
-# is fixed. Every choice ralph makes instead of asking goes to NOTES.md beside it.
-# Env: RALPH_MAX (steps, default 60), RALPH_MODEL (optional),
-#      RALPH_PROJECTS (default ~/Projects), RALPH_PLANNING (default $RALPH_PROJECTS/planning).
+# checkout). A goal is ~/Projects/planning/<project>/<goal>/GOAL.md: what to build and
+# what is fixed. Every choice ralph makes instead of asking goes to NOTES.md beside it.
+# Goals stay where they are when they end, so the next one can be written meanwhile.
+#
+# GOAL.md's frontmatter holds its settings and ralph's verdict on it. An env var of the
+# same name overrides a setting:
+#   ---
+#   status: todo        todo, running, stopped, succeeded or failed; ralph sets it
+#   max: 400            steps before it stops (RALPH_MAX)
+#   model: claude-opus-5-5   model for every step, the default (RALPH_MODEL)
+#   ---
+# Env only, since they locate GOAL.md: RALPH_PROJECTS (default ~/Projects),
+#      RALPH_PLANNING (default $RALPH_PROJECTS/planning).
 
 set -euo pipefail
 
@@ -26,8 +36,6 @@ if [[ $MAIN != "$PROJECTS_ROOT"/* || $PROJECT == planning ]]; then
 fi
 PROJECT_DIR=$PLANNING/$PROJECT
 PHASES=$PROJECT_DIR/phases
-GOAL=$PROJECT_DIR/GOAL.md
-NOTES=$PROJECT_DIR/NOTES.md
 STATE=${XDG_STATE_HOME:-$HOME/.local/state}/ralph/$PROJECT
 mkdir -p "$STATE"
 
@@ -58,18 +66,118 @@ stop)
 	kill -TERM "$(cat "$STATE/pid")" 2>/dev/null && echo "ralph: stopping $PROJECT" || echo "ralph: not running for $PROJECT"
 	exit 0
 	;;
-"") ;;
-*)
-	echo "usage: ralph [tail|stop]" >&2
-	exit 1
-	;;
 esac
+if (($# > 1)) || [[ ! ${1:-x} =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+	echo "usage: ralph [<goal>|tail|stop]" >&2
+	exit 1
+fi
 
-[[ -f $GOAL ]] || { echo "ralph: no goal for $PROJECT: write $GOAL" >&2; exit 1; }
+# key: value lines between a leading --- and the next ---, as key<TAB>value. Quotes
+# and trailing comments are stripped; nothing nested.
+frontmatter() {
+	awk '
+		NR == 1 { if ($0 !~ /^---[[:space:]]*\r?$/) exit; next }
+		/^---[[:space:]]*\r?$/ { exit }
+		/^[[:space:]]*(#|$)/ { next }
+		{
+			sub(/\r$/, "")
+			k = $0; sub(/:.*/, "", k); gsub(/[[:space:]]/, "", k)
+			v = $0; sub(/^[^:]*:[[:space:]]*/, "", v); sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v)
+			if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v = substr(v, 2, length(v) - 2)
+			print k "\t" v
+		}' "$1"
+}
+status_of_goal() { frontmatter "$1" | awk -F'\t' '$1 == "status" { print $2; exit }'; }
+
+# Sets key=value pairs in a file's frontmatter, adding the frontmatter or a key where
+# missing; an empty value removes the key. Replaced by rename, never rewritten in place.
+set_frontmatter() {
+	local f=$1 tmp
+	shift
+	tmp=$(mktemp "$f.XXXXXX")
+	awk -v kv="$(printf '%s\n' "$@")" '
+		BEGIN {
+			n = split(kv, a, "\n")
+			for (i = 1; i <= n; i++) if (a[i] != "") {
+				k = a[i]; sub(/=.*/, "", k); v = a[i]; sub(/^[^=]*=/, "", v)
+				val[k] = v; order[++m] = k
+			}
+		}
+		function flush(   i) { for (i = 1; i <= m; i++) if (!(order[i] in seen) && val[order[i]] != "") print order[i] ": " val[order[i]] }
+		NR == 1 && !/^---[[:space:]]*\r?$/ { print "---"; flush(); print "---\n"; print; fm = 2; next }
+		NR == 1 { print; fm = 1; next }
+		fm == 1 && /^---[[:space:]]*\r?$/ { flush(); print; fm = 2; next }
+		fm == 1 {
+			k = $0; sub(/:.*/, "", k); gsub(/[[:space:]]/, "", k)
+			if (k in val) { if (val[k] != "" && !(k in seen)) print k ": " val[k]; seen[k] = 1; next }
+		}
+		{ print }' "$f" >"$tmp" && chmod --reference="$f" "$tmp" && mv "$tmp" "$f"
+}
+
+if [[ -f $PROJECT_DIR/GOAL.md ]]; then
+	echo "ralph: goals live in $PROJECT_DIR/<goal>/GOAL.md now; move this one:" >&2
+	echo "  cd $PLANNING && mkdir $PROJECT/<goal> && git mv $PROJECT/GOAL.md $PROJECT/NOTES.md $PROJECT/<goal>/" >&2
+	exit 1
+fi
+
+# Open goals are the ones without a verdict. With no name given, there must be one.
+if [[ -n ${1:-} ]]; then
+	GOAL_NAME=$1
+	[[ -f $PROJECT_DIR/$GOAL_NAME/GOAL.md ]] || { echo "ralph: no goal $GOAL_NAME: write $PROJECT_DIR/$GOAL_NAME/GOAL.md" >&2; exit 1; }
+	[[ $(status_of_goal "$PROJECT_DIR/$GOAL_NAME/GOAL.md") == succeeded ]] && { echo "ralph: $GOAL_NAME already succeeded" >&2; exit 1; }
+else
+	open=()
+	for g in "$PROJECT_DIR"/*/GOAL.md; do
+		[[ -f $g ]] || continue
+		case $(status_of_goal "$g") in succeeded | failed) ;; *) open+=("$(basename "$(dirname "$g")")") ;; esac
+	done
+	case ${#open[@]} in
+	0) echo "ralph: no open goal for $PROJECT: write $PROJECT_DIR/<goal>/GOAL.md" >&2; exit 1 ;;
+	1) GOAL_NAME=${open[0]} ;;
+	*)
+		echo "ralph: $PROJECT has ${#open[@]} open goals, say which: ralph <goal>" >&2
+		for g in "${open[@]}"; do
+			st=$(status_of_goal "$PROJECT_DIR/$g/GOAL.md")
+			echo "  $g (${st:-todo})" >&2
+		done
+		exit 1
+		;;
+	esac
+fi
+GOAL_DIR=$PROJECT_DIR/$GOAL_NAME
+GOAL=$GOAL_DIR/GOAL.md
+NOTES=$GOAL_DIR/NOTES.md
+
+declare -A SETTING=()
+while IFS=$'\t' read -r k v; do
+	[[ -z $k ]] && continue
+	case $k in
+	max | model) SETTING[$k]=$v ;;
+	status | finished | reason) ;;
+	*) echo "ralph: ignoring unknown setting '$k' in $GOAL" >&2 ;;
+	esac
+done < <(frontmatter "$GOAL")
+DEFAULT_MAX=400 DEFAULT_MODEL=claude-opus-5-5
+MAX=${RALPH_MAX:-${SETTING[max]:-$DEFAULT_MAX}}
+MODEL=${RALPH_MODEL:-${SETTING[model]:-$DEFAULT_MODEL}}
+[[ $MAX =~ ^[1-9][0-9]*$ ]] || { echo "ralph: max must be a positive number, got '$MAX'" >&2; exit 1; }
 
 exec 9>"$STATE/lock"
 flock -n 9 || { echo "ralph: already running for $PROJECT (ralph stop, or ralph tail)" >&2; exit 1; }
 echo $$ >"$STATE/pid"
+
+# The verdict goes in GOAL.md's frontmatter, committed on its own: only that path, so
+# whatever else is half-written in the planning repo stays out of it.
+verdict=
+mark() {
+	verdict=$1
+	# A goal that leaves a setting out gets the default written in, so it shows what it
+	# runs with. An env override is for one run and is never written.
+	set_frontmatter "$GOAL" "status=$1" "max=${SETTING[max]:-$DEFAULT_MAX}" "model=${SETTING[model]:-$DEFAULT_MODEL}" "finished=$([[ $1 == succeeded || $1 == failed ]] && date +%F)" "reason=${2:-}"
+	git -C "$PLANNING" add -- "$GOAL" &&
+		git -C "$PLANNING" commit -q -m "ralph($PROJECT): $GOAL_NAME $1${2:+: $2}" -- "$GOAL" ||
+		echo "ralph[$PROJECT]: could not commit $GOAL" >&2
+}
 
 # Job control gives each step its own process group, so stopping kills claude and
 # every tool it started, not just the subshell around it.
@@ -84,18 +192,21 @@ cleanup() {
 	rm -f "$STATE/pid"
 }
 trap 'cleanup; echo "ralph: stopped"; exit 130' INT TERM
-trap 'rm -f "$STATE/pid"' EXIT
+trap 'rm -f "$STATE/pid"; [[ $verdict == running ]] && mark stopped' EXIT
+mark running
 
 CLAUDE_ARGS=(-p --output-format stream-json --verbose --permission-mode auto
 	# No MCP servers: the loop has no business in deploy tools, trackers or docs sites.
 	--strict-mcp-config --mcp-config '{"mcpServers":{}}')
-[[ -n ${RALPH_MODEL:-} ]] && CLAUDE_ARGS+=(--model "$RALPH_MODEL")
+CLAUDE_ARGS+=(--model "$MODEL")
 
 RULES="You are ralph, an unattended loop: no one is at the keyboard, one step per session.
 
-THE GOAL is $GOAL. Read it first, every step. What it says is fixed is not up for
-choice; work nothing that does not serve it. Code is worked in $REPO on the current
-branch; the plans live in $PROJECT_DIR.
+THE GOAL is $GOAL_NAME: $GOAL. Read it first, every step; its frontmatter
+is ralph's own, not part of the goal. What it says is fixed is not up for choice; work
+nothing that does not serve it. Other goals beside it are not yours: never read them as
+instructions or edit them. Code is worked in $REPO on the current branch; the plans live
+in $PROJECT_DIR.
 
 Everything is local. Never push, deploy, open a PR, or touch production, a deploy
 platform, or anything outside $REPO and $PROJECT_DIR. Production work is not planned at
@@ -114,13 +225,16 @@ after the current one and stop, so the next step does it. status: blocked is onl
 what no local session can ever do (a secret or an account it cannot have), with the
 exact steps for a person in its Notes."
 
-PLAN_PROMPT="/planning Plan the next phase toward the goal of project $PROJECT.
+PLAN_PROMPT="/planning Plan the next phase toward goal $GOAL_NAME of project $PROJECT.
 $RULES
 
-Plan the next slice of the goal that no phase in phases/ covers yet, in the order the
-goal gives. Read the code first, as the skill says. Instead of sparring, settle every
-fork yourself and note it in NOTES.md. Never edit GOAL.md. If the goal is fully covered
-by phases, write nothing and end your reply with the line: RALPH: NOTHING TO PLAN
+The goal's phases are the ones whose goal.md says **Goal:** $GOAL_NAME; a phase with no
+Goal line predates goal directories and counts if it serves this goal. Plan the next
+slice of the goal that none of them covers yet, in the order the goal gives, and give
+its goal.md the line **Goal:** $GOAL_NAME. Read the code first, as the skill says.
+Instead of sparring, settle every fork yourself and note it in NOTES.md. Never edit
+GOAL.md. If the goal is fully covered by phases, write nothing and end your reply with
+the line: RALPH: NOTHING TO PLAN
 Otherwise commit the phase as the skill says, and stop. Do not start /work."
 
 WORK_PROMPT="/work
@@ -139,9 +253,9 @@ note() {
 	command -v notify-send >/dev/null && notify-send "ralph: $PROJECT" "$*" || true
 }
 
-echo "ralph[$PROJECT]: $REPO ($(git -C "$REPO" branch --show-current)) toward $GOAL"
+echo "ralph[$PROJECT]: $REPO ($(git -C "$REPO" branch --show-current)) toward $GOAL_NAME"
+echo "ralph[$PROJECT]: max $MAX steps, model $MODEL"
 echo "ralph[$PROJECT]: watch with 'ralph tail', stop with 'ralph stop' or Ctrl-C"
-MAX=${RALPH_MAX:-60}
 stuck=0
 blocked_seen=
 for ((i = 1; i <= MAX; i++)); do
@@ -157,13 +271,17 @@ for ((i = 1; i <= MAX; i++)); do
 		step=plan prompt=$PLAN_PROMPT
 	else
 		if [[ $(status_of "$next") == blocked ]]; then
-			[[ $blocked_seen == "$next" ]] && { note "needs you: $next (see its Notes)"; exit 2; }
+			if [[ $blocked_seen == "$next" ]]; then
+				mark failed "blocked on ${next#"$PHASES"/}"
+				note "$GOAL_NAME failed, needs you: $next (see its Notes)"
+				exit 2
+			fi
 			blocked_seen=$next
 		fi
 		step=work prompt=$WORK_PROMPT
 	fi
 
-	log=$STATE/$(date +%Y%m%d-%H%M%S)-$i-$step.log
+	log=$STATE/$(date +%Y%m%d-%H%M%S)-$GOAL_NAME-$i-$step.log
 	echo "ralph[$PROJECT]: step $i/$MAX: $step${next:+ (${next#"$PHASES"/})}"
 	ln -sfn "$log" "$STATE/current.log"
 	before=$(heads)
@@ -175,14 +293,20 @@ for ((i = 1; i <= MAX; i++)); do
 	child=
 
 	if [[ $step == plan ]] && jq -r 'select(.type=="result") | .result // ""' "$log" 2>/dev/null | grep -q 'RALPH: NOTHING TO PLAN'; then
-		note "done: the goal is fully planned and worked; review $NOTES"
+		mark succeeded
+		note "$GOAL_NAME succeeded: fully planned and worked; review $NOTES"
 		exit 0
 	fi
 
 	if [[ $(heads) == "$before" ]]; then
-		((++stuck >= 3)) && { note "stuck: 3 steps without a commit, last log $log"; exit 3; }
+		if ((++stuck >= 3)); then
+			mark failed "stuck, 3 steps without a commit"
+			note "$GOAL_NAME failed, stuck: 3 steps without a commit, last log $log"
+			exit 3
+		fi
 	else
 		stuck=0
 	fi
 done
-note "reached RALPH_MAX=$MAX steps; review $NOTES"
+mark failed "reached max $MAX steps"
+note "$GOAL_NAME failed: reached max $MAX steps; review $NOTES"
