@@ -19,6 +19,10 @@
 #   max: 400            steps before it stops (RALPH_MAX)
 #   model: claude-opus-5-5   model for every step, the default (RALPH_MODEL)
 #   ---
+# A task's own frontmatter may name a cheaper model for its work step (model:
+# claude-sonnet-5), which /planning gives tasks that repeat a pattern the repo already
+# has. That model gets one try; if the task is not done after it, the goal's model
+# takes over. RALPH_MODEL overrides task models too.
 # Env only, since they locate GOAL.md: RALPH_PROJECTS (default ~/Projects),
 #      RALPH_PLANNING (default $RALPH_PROJECTS/planning).
 
@@ -198,7 +202,6 @@ mark running
 CLAUDE_ARGS=(-p --output-format stream-json --verbose --permission-mode auto
 	# No MCP servers: the loop has no business in deploy tools, trackers or docs sites.
 	--strict-mcp-config --mcp-config '{"mcpServers":{}}')
-CLAUDE_ARGS+=(--model "$MODEL")
 
 RULES="You are ralph, an unattended loop: no one is at the keyboard, one step per session.
 
@@ -223,7 +226,20 @@ Never skip a problem or leave it for later. If something is broken, missing or w
 where the work goes, fix it now as part of the task; if it is too big, add a task right
 after the current one and stop, so the next step does it. status: blocked is only for
 what no local session can ever do (a secret or an account it cannot have), with the
-exact steps for a person in its Notes."
+exact steps for a person in its Notes.
+
+Never end a reply while a command you started is still running. This session is
+headless: once your reply ends it may exit at any moment and kill everything still
+running in the background, so a reply that says 'Waiting.' throws that work away. Run
+long commands in the foreground with a long timeout; when one takes longer than a
+single call allows, start it in the background and wait for it within the same reply
+(an until-loop or Monitor), checking in chunks of under ten minutes, until it is done.
+
+Save progress the next step can pick up. When a task takes long (a sweep of every
+test suite, many files to change), write what is done to the task's Notes as you go,
+for example which suites passed at which commit, and commit it with the planning repo.
+If this session ends early, the next one continues from there instead of starting
+over."
 
 PLAN_PROMPT="/planning Plan the next phase toward goal $GOAL_NAME of project $PROJECT.
 $RULES
@@ -253,11 +269,41 @@ note() {
 	command -v notify-send >/dev/null && notify-send "ralph: $PROJECT" "$*" || true
 }
 
+# Prints the epoch at which the usage limit resets when the step in $1 ended on it (0
+# when no reset time is known), and nothing when it did not. Claude logs every limit
+# check as a rate_limit_event, "rejected" once the five-hour or weekly limit is hit, and
+# a session that runs into it ends with a 429 result ("You've hit your session limit").
+limit_reset() {
+	jq -Rrn '
+		[inputs | fromjson? | objects] as $e
+		| ($e | map(select(.type == "rate_limit_event") | .rate_limit_info) | last) as $limit
+		| ($e | map(select(.type == "result")) | last) as $result
+		| if $limit.status == "rejected"
+			or $result.api_error_status == 429
+			or (($result.is_error // false) and (($result.result // "") | test("hit your (session |weekly )?limit|usage limit"; "i")))
+		  then ($limit.resetsAt // 0) else empty end' "$1" 2>/dev/null
+}
+
+# Sleeps until the limit has reset, a minute past it so the new window is really open.
+# Backgrounded and waited on, like a step, so Ctrl-C and 'ralph stop' still stop it.
+wait_for_limit() {
+	local reset=$1 now
+	now=$(date +%s)
+	((reset > now)) || reset=$((now + ${RALPH_LIMIT_WAIT:-600}))
+	reset=$((reset + 60))
+	note "out of usage, waiting until $(date -d "@$reset" '+%a %H:%M') to carry on"
+	sleep $((reset - now)) &
+	child=$!
+	wait "$child" || true
+	child=
+}
+
 echo "ralph[$PROJECT]: $REPO ($(git -C "$REPO" branch --show-current)) toward $GOAL_NAME"
 echo "ralph[$PROJECT]: max $MAX steps, model $MODEL"
 echo "ralph[$PROJECT]: watch with 'ralph tail', stop with 'ralph stop' or Ctrl-C"
 stuck=0
 blocked_seen=
+cheap_tried=
 for ((i = 1; i <= MAX; i++)); do
 	# The first task not done, in phase order. A blocked one gets a work step that
 	# decides it; if that step leaves it blocked, it truly needs a person.
@@ -281,16 +327,38 @@ for ((i = 1; i <= MAX; i++)); do
 		step=work prompt=$WORK_PROMPT
 	fi
 
+	# The task's own model, once; the goal's model when there is none, when the env
+	# overrides, or when that one try left the task unfinished.
+	step_model=$MODEL
+	if [[ $step == work && -z ${RALPH_MODEL:-} && $cheap_tried != "$next" ]]; then
+		task_model=$(frontmatter "$next" | awk -F'\t' '$1 == "model" { print $2; exit }')
+		if [[ $task_model =~ ^[a-z0-9][a-z0-9.-]*$ && $task_model != "$MODEL" ]]; then
+			step_model=$task_model
+			cheap_tried=$next
+		fi
+	fi
+
 	log=$STATE/$(date +%Y%m%d-%H%M%S)-$GOAL_NAME-$i-$step.log
-	echo "ralph[$PROJECT]: step $i/$MAX: $step${next:+ (${next#"$PHASES"/})}"
+	echo "ralph[$PROJECT]: step $i/$MAX: $step${next:+ (${next#"$PHASES"/})} on $step_model"
 	ln -sfn "$log" "$STATE/current.log"
 	before=$(heads)
 	# Backgrounded and waited on so Ctrl-C and 'ralph stop' reach the trap at once.
 	# The prompt goes in on stdin: --mcp-config is variadic and would swallow it.
-	(cd "$REPO" && printf "%s" "$prompt" | exec claude "${CLAUDE_ARGS[@]}" 9>&-) >"$log" 2>&1 &
+	(cd "$REPO" && printf "%s" "$prompt" | exec claude "${CLAUDE_ARGS[@]}" --model "$step_model" 9>&-) >"$log" 2>&1 &
 	child=$!
 	wait "$child" || true
 	child=
+
+	# Running out of usage is not the step's fault: wait for the limit to reset and run
+	# the step again, without counting it toward max, stuck, or a blocked task's one try.
+	reset=$(limit_reset "$log")
+	if [[ -n $reset ]]; then
+		[[ $blocked_seen == "$next" ]] && blocked_seen=
+		[[ $cheap_tried == "$next" && $step_model != "$MODEL" ]] && cheap_tried=
+		wait_for_limit "$reset"
+		((i--)) || true
+		continue
+	fi
 
 	if [[ $step == plan ]] && jq -r 'select(.type=="result") | .result // ""' "$log" 2>/dev/null | grep -q 'RALPH: NOTHING TO PLAN'; then
 		mark succeeded

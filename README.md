@@ -70,6 +70,11 @@ env override is for that run only and is never written). Unknown keys are
 ignored with a warning. Steps are told
 the frontmatter is ralph's, not part of the goal.
 
+A task can name its own model for its work step, in its frontmatter
+(`model: claude-sonnet-5`). `/planning` does this for tasks that repeat a
+pattern the repo already has, to stretch the usage limit. That model gets one
+try. If the task is not done after it, the goal's model works it from there.
+
 Ralph sets `status` and commits only `GOAL.md` each time:
 
 | `status`    | when                                                                        |
@@ -94,6 +99,9 @@ Ralph sets `status` and commits only `GOAL.md` each time:
      something only a person can do, like a secret; its Notes say what. `failed`;
    - 3 steps in a row made no commit: stuck, see the last log. `failed`;
    - `max` steps have run. `failed`.
+5. A step that runs out of Claude usage (the five-hour or the weekly limit) is not
+   a step: ralph waits until the limit resets, then runs it again. It counts toward
+   neither `max` nor the 3 steps without a commit. `ralph stop` ends the wait too.
 
 ## The rules every step gets
 
@@ -122,9 +130,10 @@ here.
 | Variable         | Default                         |                                     |
 | ---------------- | ------------------------------- | ----------------------------------- |
 | `RALPH_MAX`      | `max`, else `400`               | steps before it stops               |
-| `RALPH_MODEL`    | `model`, else `claude-opus-5-5` | model for every step                |
+| `RALPH_MODEL`    | `model`, else `claude-opus-5-5` | model for every step, task models included |
 | `RALPH_PROJECTS` | `~/Projects`                    | where project repositories live     |
 | `RALPH_PLANNING` | `$RALPH_PROJECTS/planning`      | where the planning directories live |
+| `RALPH_LIMIT_WAIT` | `600`                         | seconds to wait when out of usage with no reset time |
 
 Logs are in `~/.local/state/ralph/<project>/`, one per step. `current.log`
 points at the running one.
